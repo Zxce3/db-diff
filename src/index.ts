@@ -1,31 +1,35 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { Client } from "pg";
-import { introspectSchema, getRowCount } from "./schema.js";
+import { connectDriver } from "./drivers/index.js";
 import { diffSchemas, diffRowCounts } from "./diff.js";
 import { formatSchemaDiff, formatRowCountDiff } from "./report.js";
 import { suggestMigration } from "./migration.js";
-import { openSshTunnel, parseSshTarget, type TunnelHandle } from "./tunnel.js";
 
 const program = new Command();
 
 program
   .name("db-diff")
   .description(
-    "Compares schemas and row-count distributions between two database instances and outputs a diff plus a migration script suggestion."
+    "Compares schemas and row-count distributions between two database instances (Postgres, MySQL, or SQLite) and outputs a diff plus a migration script suggestion."
   )
-  .requiredOption("--source <connectionString>", "connection string for the source database (e.g. staging)")
-  .requiredOption("--target <connectionString>", "connection string for the target database (e.g. PR branch)")
+  .requiredOption(
+    "--source <connectionString>",
+    "connection string for the source database (postgres://, mysql://, or a SQLite file path)"
+  )
+  .requiredOption(
+    "--target <connectionString>",
+    "connection string for the target database (postgres://, mysql://, or a SQLite file path)"
+  )
   .option(
     "--source-ssh <user@host[:port]>",
-    "SSH host to tunnel through to reach --source (e.g. a staging bastion)"
+    "SSH host to tunnel through to reach --source (postgres/mysql only, e.g. a staging bastion)"
   )
   .option(
     "--target-ssh <user@host[:port]>",
-    "SSH host to tunnel through to reach --target (e.g. a prod bastion)"
+    "SSH host to tunnel through to reach --target (postgres/mysql only, e.g. a prod bastion)"
   )
   .option("--ssh-key <path>", "private key file to use for SSH tunnels (defaults to ~/.ssh/id_ed25519 or id_rsa)")
-  .option("--schema <name>", "schema to compare", "public")
+  .option("--schema <name>", "schema to compare (postgres only)", "public")
   .option("--row-count-threshold <percent>", "percent row-count delta considered drift", "20")
   .option("--fail-on-drift", "exit non-zero if schema drift or row-count drift is found", false)
   .option("--migration-out <path>", "write suggested migration SQL to this file instead of stdout")
@@ -43,35 +47,24 @@ const options = program.opts<{
   migrationOut?: string;
 }>();
 
-async function resolveConnectionString(
-  connectionString: string,
-  sshSpec: string | undefined,
-  tunnels: TunnelHandle[]
-): Promise<string> {
-  if (!sshSpec) return connectionString;
-  const tunnel = await openSshTunnel(parseSshTarget(sshSpec), connectionString, options.sshKey);
-  tunnels.push(tunnel);
-  return tunnel.connectionString;
-}
-
 async function main() {
-  const tunnels: TunnelHandle[] = [];
-
-  const [sourceConnectionString, targetConnectionString] = await Promise.all([
-    resolveConnectionString(options.source, options.sourceSsh, tunnels),
-    resolveConnectionString(options.target, options.targetSsh, tunnels),
+  const [source, target] = await Promise.all([
+    connectDriver(options.source, {
+      schema: options.schema,
+      sshTarget: options.sourceSsh,
+      sshKeyPath: options.sshKey,
+    }),
+    connectDriver(options.target, {
+      schema: options.schema,
+      sshTarget: options.targetSsh,
+      sshKeyPath: options.sshKey,
+    }),
   ]);
-
-  const sourceClient = new Client({ connectionString: sourceConnectionString });
-  const targetClient = new Client({ connectionString: targetConnectionString });
-
-  await sourceClient.connect();
-  await targetClient.connect();
 
   try {
     const [sourceSchema, targetSchema] = await Promise.all([
-      introspectSchema(sourceClient, options.schema),
-      introspectSchema(targetClient, options.schema),
+      source.driver.introspectSchema(),
+      target.driver.introspectSchema(),
     ]);
 
     const schemaDiff = diffSchemas(sourceSchema, targetSchema);
@@ -80,10 +73,10 @@ async function main() {
     const targetCounts = new Map<string, number>();
 
     for (const tableName of sourceSchema.tables.keys()) {
-      sourceCounts.set(tableName, await getRowCount(sourceClient, tableName, options.schema));
+      sourceCounts.set(tableName, await source.driver.getRowCount(tableName));
     }
     for (const tableName of targetSchema.tables.keys()) {
-      targetCounts.set(tableName, await getRowCount(targetClient, tableName, options.schema));
+      targetCounts.set(tableName, await target.driver.getRowCount(tableName));
     }
 
     const rowCountDiffs = diffRowCounts(sourceCounts, targetCounts);
@@ -93,7 +86,15 @@ async function main() {
     console.log();
     console.log(formatRowCountDiff(rowCountDiffs, threshold));
 
-    const migrationSql = suggestMigration(schemaDiff, sourceSchema);
+    if (source.driver.dialect !== target.driver.dialect) {
+      console.log();
+      console.log(
+        `Note: source is ${source.driver.dialect}, target is ${target.driver.dialect} — the suggested migration ` +
+          `uses ${source.driver.dialect} syntax and is a structural hint only, not directly runnable against target.`
+      );
+    }
+
+    const migrationSql = suggestMigration(schemaDiff, sourceSchema, source.driver.dialect);
 
     if (options.migrationOut) {
       const fs = await import("node:fs/promises");
@@ -117,9 +118,10 @@ async function main() {
       process.exitCode = 1;
     }
   } finally {
-    await sourceClient.end();
-    await targetClient.end();
-    for (const tunnel of tunnels) tunnel.close();
+    await source.driver.close();
+    await target.driver.close();
+    source.closeTunnel();
+    target.closeTunnel();
   }
 }
 
