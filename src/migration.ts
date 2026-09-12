@@ -1,5 +1,9 @@
 import type { SchemaDiff } from "./diff.js";
-import type { DatabaseSchema } from "./schema.js";
+import type { DatabaseSchema, Dialect } from "./drivers/types.js";
+
+function quoteIdent(dialect: Dialect, name: string): string {
+  return dialect === "mysql" ? `\`${name}\`` : `"${name}"`;
+}
 
 function columnDefinitionSql(dataType: string, isNullable: boolean, defaultValue: string | null): string {
   const parts = [dataType];
@@ -8,24 +12,33 @@ function columnDefinitionSql(dataType: string, isNullable: boolean, defaultValue
   return parts.join(" ");
 }
 
-export function suggestMigration(diff: SchemaDiff, source: DatabaseSchema): string {
+/**
+ * Generates a suggested migration in the source database's dialect. Assumes
+ * source and target are the same engine — if they aren't (e.g. diffing a
+ * Postgres staging DB against a SQLite test DB), treat this as a structural
+ * hint only; the SQL syntax won't be directly runnable against the target.
+ */
+export function suggestMigration(diff: SchemaDiff, source: DatabaseSchema, dialect: Dialect): string {
   const statements: string[] = [];
+  const q = (name: string) => quoteIdent(dialect, name);
 
   for (const tableName of diff.removedTables) {
-    statements.push(`-- Table "${tableName}" exists in source but not in target.`);
-    statements.push(`-- CREATE TABLE "${tableName}" (...); -- fill in from source schema`);
+    statements.push(`-- Table ${q(tableName)} exists in source but not in target.`);
+    statements.push(`-- CREATE TABLE ${q(tableName)} (...); -- fill in from source schema`);
   }
 
   for (const tableName of diff.addedTables) {
-    statements.push(`-- Table "${tableName}" exists in target but not in source.`);
-    statements.push(`DROP TABLE IF EXISTS "${tableName}"; -- review before running: destructive`);
+    statements.push(`-- Table ${q(tableName)} exists in target but not in source.`);
+    statements.push(`DROP TABLE IF EXISTS ${q(tableName)}; -- review before running: destructive`);
   }
 
   for (const tableDiff of diff.changedTables) {
+    const table = q(tableDiff.name);
+
     for (const colDiff of tableDiff.columnDiffs) {
       if (colDiff.kind === "added" && colDiff.after) {
         statements.push(
-          `ALTER TABLE "${tableDiff.name}" ADD COLUMN "${colDiff.name}" ${columnDefinitionSql(
+          `ALTER TABLE ${table} ADD COLUMN ${q(colDiff.name)} ${columnDefinitionSql(
             colDiff.after.dataType,
             colDiff.after.isNullable,
             colDiff.after.defaultValue
@@ -33,36 +46,27 @@ export function suggestMigration(diff: SchemaDiff, source: DatabaseSchema): stri
         );
       } else if (colDiff.kind === "removed" && colDiff.before) {
         statements.push(
-          `-- Column "${colDiff.name}" missing from target, present in source.\n` +
-            `ALTER TABLE "${tableDiff.name}" ADD COLUMN "${colDiff.name}" ${columnDefinitionSql(
+          `-- Column ${q(colDiff.name)} missing from target, present in source.\n` +
+            `ALTER TABLE ${table} ADD COLUMN ${q(colDiff.name)} ${columnDefinitionSql(
               colDiff.before.dataType,
               colDiff.before.isNullable,
               colDiff.before.defaultValue
             )};`
         );
       } else if (colDiff.kind === "changed" && colDiff.before && colDiff.after) {
-        if (colDiff.before.dataType !== colDiff.after.dataType) {
-          statements.push(
-            `ALTER TABLE "${tableDiff.name}" ALTER COLUMN "${colDiff.name}" TYPE ${colDiff.before.dataType} USING "${colDiff.name}"::${colDiff.before.dataType}; -- target had ${colDiff.after.dataType}`
-          );
-        }
-        if (colDiff.before.isNullable !== colDiff.after.isNullable) {
-          statements.push(
-            `ALTER TABLE "${tableDiff.name}" ALTER COLUMN "${colDiff.name}" ${
-              colDiff.before.isNullable ? "DROP NOT NULL" : "SET NOT NULL"
-            };`
-          );
-        }
+        statements.push(
+          ...columnChangeStatements(dialect, tableDiff.name, colDiff.name, colDiff.before, colDiff.after)
+        );
       }
     }
 
     for (const indexName of tableDiff.removedIndexes) {
       const idx = source.tables.get(tableDiff.name)?.indexes.find((i) => i.name === indexName);
-      if (idx) statements.push(`${idx.definition};`);
+      if (idx) statements.push(`-- restore missing index: ${idx.definition};`);
     }
 
     for (const indexName of tableDiff.addedIndexes) {
-      statements.push(`DROP INDEX IF EXISTS "${indexName}"; -- review before running: destructive`);
+      statements.push(`DROP INDEX ${q(indexName)}${dialect === "mysql" ? ` ON ${table}` : ""}; -- review before running: destructive`);
     }
   }
 
@@ -71,9 +75,59 @@ export function suggestMigration(diff: SchemaDiff, source: DatabaseSchema): stri
   }
 
   return [
-    "-- Suggested migration to bring target in line with source schema.",
+    `-- Suggested ${dialect} migration to bring target in line with source schema.`,
     "-- Generated by db-diff. Review carefully before applying, especially destructive statements.",
     "",
     ...statements,
   ].join("\n");
+}
+
+function columnChangeStatements(
+  dialect: Dialect,
+  tableName: string,
+  columnName: string,
+  before: { dataType: string; isNullable: boolean },
+  after: { dataType: string; isNullable: boolean }
+): string[] {
+  const table = quoteIdent(dialect, tableName);
+  const col = quoteIdent(dialect, columnName);
+  const statements: string[] = [];
+
+  if (dialect === "sqlite") {
+    if (before.dataType !== after.dataType || before.isNullable !== after.isNullable) {
+      statements.push(
+        `-- SQLite has no ALTER COLUMN: recreate ${table} with ${col} as ${before.dataType}` +
+          `${before.isNullable ? "" : " NOT NULL"} and copy the data over (target had ${after.dataType}).`
+      );
+    }
+    return statements;
+  }
+
+  if (before.dataType !== after.dataType) {
+    if (dialect === "mysql") {
+      statements.push(
+        `ALTER TABLE ${table} MODIFY COLUMN ${col} ${before.dataType}${
+          before.isNullable ? "" : " NOT NULL"
+        }; -- target had ${after.dataType}`
+      );
+    } else {
+      statements.push(
+        `ALTER TABLE ${table} ALTER COLUMN ${col} TYPE ${before.dataType} USING ${col}::${before.dataType}; -- target had ${after.dataType}`
+      );
+    }
+  }
+
+  if (before.isNullable !== after.isNullable && before.dataType === after.dataType) {
+    if (dialect === "mysql") {
+      statements.push(
+        `ALTER TABLE ${table} MODIFY COLUMN ${col} ${before.dataType}${before.isNullable ? "" : " NOT NULL"};`
+      );
+    } else {
+      statements.push(
+        `ALTER TABLE ${table} ALTER COLUMN ${col} ${before.isNullable ? "DROP NOT NULL" : "SET NOT NULL"};`
+      );
+    }
+  }
+
+  return statements;
 }
