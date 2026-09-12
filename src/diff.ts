@@ -1,4 +1,4 @@
-import type { ColumnInfo, DatabaseSchema, TableSchema } from "./schema.js";
+import type { ColumnInfo, DatabaseSchema, TableSchema } from "./drivers/types.js";
 
 export interface ColumnDiff {
   name: string;

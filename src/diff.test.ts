@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { diffSchemas, diffRowCounts } from "./diff.js";
-import type { DatabaseSchema } from "./schema.js";
+import type { DatabaseSchema } from "./drivers/types.js";
 
 function schema(tables: DatabaseSchema["tables"] extends Map<string, infer T> ? T[] : never): DatabaseSchema {
   return { tables: new Map(tables.map((t) => [t.name, t])) };
