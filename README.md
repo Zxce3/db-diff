@@ -69,3 +69,18 @@ The suggested migration is a starting point, not a ready-to-run script — revie
 npm run dev -- --source ... --target ...
 npm test
 ```
+
+## Releasing
+
+Versioning follows semver via `package.json`'s `version` field. Every push to `master` runs the CI
+workflow (build + test). To cut a release:
+
+```
+npm version patch   # or minor / major
+git push --follow-tags
+```
+
+`npm version` bumps `package.json`, commits it, and creates a matching `vX.Y.Z` git tag. Pushing that
+tag triggers the release workflow (`.github/workflows/release.yml`), which builds, tests, verifies the
+tag matches `package.json`, and publishes a GitHub Release with a `db-diff-vX.Y.Z.tar.gz` artifact
+containing the compiled `dist/`, `package.json`, `package-lock.json`, and `README.md`.
